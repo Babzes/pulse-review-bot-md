@@ -37,6 +37,9 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set +e
+          # Résultat (findings) sur stdout ; ligne de monitoring sur stderr.
+          # Collecte #1 : volume monté -> out/runs.jsonl (écrit par le script).
+          # Collecte #2 : redirection stderr -> out/run.stderr.jsonl (filet de sécurité).
           docker run --rm \
             -e ANTHROPIC_API_KEY \
             -e PR_NUMBER="${{ github.event.pull_request.number }}" \
@@ -44,8 +47,10 @@ jobs:
             -e BASE_REF="${{ github.event.pull_request.base.ref }}" \
             -e OUT_DIR=/work \
             -v "$PWD/out:/work" \
-            pulse-ai-review:ci /work/pr.diff
+            pulse-ai-review:ci /work/pr.diff \
+            1> out/result.stdout 2> out/run.stderr.jsonl
           echo "exit=$?" >> "$GITHUB_OUTPUT"
+          echo "::group::ligne de monitoring (stderr)"; cat out/run.stderr.jsonl; echo "::endgroup::"
 
       - name: poste les commentaires inline
         if: always()
@@ -72,8 +77,9 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          [ -s out/runs.jsonl ] || cp -f out/run.stderr.jsonl out/runs.jsonl 2>/dev/null || true
           [ -s out/runs.jsonl ] || { echo "Pas de run log."; exit 0; }
-          metrics="$(python3 agent/metrics.py out/runs.jsonl)"
+          metrics="$(bash agent/metrics.sh out/runs.jsonl)"
           {
             echo "### Métriques de pilotage (run courant)"
             echo '```json'
@@ -91,6 +97,7 @@ jobs:
           name: ai-review-runs-${{ github.event.pull_request.head.sha }}
           path: |
             out/runs.jsonl
+            out/run.stderr.jsonl
             out/findings.json
 
       - name: gate — bloque sur critical

@@ -31,7 +31,8 @@ diff="$(cat "$DIFF_FILE")"
   echo "Tableau vide [] si rien à signaler."
   echo "--- DIFF ---"
   echo "$diff"
-} | claude -p --output-format json | jq -r '.result' > "$OUT_DIR/result.txt"
+# stderr de claude isolé dans un log : le seul stderr du run sera la ligne de monitoring.
+} | claude -p --output-format json 2>"$OUT_DIR/claude.log" | jq -r '.result' > "$OUT_DIR/result.txt"
 
 # Extrait le tableau JSON et lit "crit warn info total"
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -51,6 +52,10 @@ rec=$(jq -nc \
     findings_total:$total, critical:$crit, warning:$warn, info:$info,
     decision:$decision, duration_s:$dur}')
 
-echo "$rec" | tee -a "$OUT_DIR/runs.jsonl"
+# Monitoring : la ligne JSON va sur STDERR (jamais mélangée au résultat) + fichier.
+# Le RÉSULTAT (findings) va sur STDOUT, propre et parsable.
+printf '%s\n' "$rec" >> "$OUT_DIR/runs.jsonl"
+printf '%s\n' "$rec" >&2
+cat "$OUT_DIR/findings.json"
 
 [ "$crit" -gt 0 ] && exit 1 || exit 0
