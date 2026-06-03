@@ -1,0 +1,5 @@
+# Contexte de build minimal : seul l'agent entre dans l'image.
+# Empêche .git, services, tests, JSON locaux, .env… de fuiter dans l'image.
+*
+!agent
+!agent/**

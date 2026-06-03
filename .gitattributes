@@ -1,0 +1,3 @@
+# Scripts exécutés sous Linux (CI / image Docker) : toujours en LF.
+*.sh   text eol=lf
+*.py   text eol=lf

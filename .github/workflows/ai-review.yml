@@ -1,6 +1,7 @@
 # AI review (étape agentique) — déclenchée sur PR.
-# Installe Node + Claude Code, analyse le diff (revue + sécurité),
-# poste les commentaires inline et BLOQUE la PR sur un finding `critical`.
+# 1) Packaging : l'agent tourne dans une image Docker reproductible.
+# 2) Hygiène du secret : la clé n'entre jamais dans l'image, injectée au runtime.
+# 3) Monitoring : log structuré par run -> artifact -> 3 métriques de pilotage.
 name: ai-review
 on:
   pull_request:
@@ -17,39 +18,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: install Claude Code
-        run: npm install -g @anthropic-ai/claude-code
 
-      - name: AI review (revue + sécurité)
+      - name: build image (reproductible, SANS secret)
+        run: docker build -t pulse-ai-review:ci .
+
+      - name: prépare le diff
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
           git fetch origin "$BASE_REF" --depth=1
-          git diff "origin/$BASE_REF...HEAD" > pr.diff
-          {
-            echo "Tu es un relecteur de code et de sécurité pour le projet Pulse."
-            echo "Analyse le diff de PR ci-dessous. Repère notamment :"
-            echo "secrets/tokens en dur, injection SQL (concaténation de chaînes),"
-            echo "print()/logs de debug oubliés, tests supprimés pour faire passer la CI."
-            echo 'Réponds UNIQUEMENT par un tableau JSON, sans texte ni balises autour, au format :'
-            echo '[{"file":"chemin","line":N,"severity":"critical|warning|info","category":"...","message":"..."}]'
-            echo "Tableau vide [] si rien à signaler."
-            echo "--- DIFF ---"
-            cat pr.diff
-          } | claude -p --output-format json | jq -r '.result' > result.txt
-          python3 - <<'PY'
-          import json, re, pathlib
-          raw = pathlib.Path("result.txt").read_text()
-          m = re.search(r"\[.*\]", raw, re.S)
-          data = json.loads(m.group(0)) if m else []
-          pathlib.Path("findings.json").write_text(json.dumps(data))
-          print(f"{len(data)} finding(s)")
-          PY
+          mkdir -p out
+          git diff "origin/$BASE_REF...HEAD" > out/pr.diff
+
+      - name: run agent (clé injectée au RUNTIME)
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set +e
+          docker run --rm \
+            -e ANTHROPIC_API_KEY \
+            -e PR_NUMBER="${{ github.event.pull_request.number }}" \
+            -e COMMIT_SHA="${{ github.event.pull_request.head.sha }}" \
+            -e BASE_REF="${{ github.event.pull_request.base.ref }}" \
+            -e OUT_DIR=/work \
+            -v "$PWD/out:/work" \
+            pulse-ai-review:ci /work/pr.diff
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
 
       - name: poste les commentaires inline
         if: always()
@@ -59,27 +55,49 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          [ -s findings.json ] || echo "[]" > findings.json
-          [ "$(jq 'length' findings.json)" -eq 0 ] && { echo "Aucun finding."; exit 0; }
-          jq -n --slurpfile f findings.json '{
+          [ -s out/findings.json ] || echo "[]" > out/findings.json
+          [ "$(jq 'length' out/findings.json)" -eq 0 ] && { echo "Aucun finding."; exit 0; }
+          jq -n --slurpfile f out/findings.json '{
             event: "COMMENT",
             body: "Revue IA Pulse (automatique)",
             comments: ( $f[0] | map({
-              path: .file,
-              line: .line,
-              side: "RIGHT",
+              path: .file, line: .line, side: "RIGHT",
               body: ("**" + .severity + "** [" + .category + "] " + .message)
             }) )
-          }' > payload.json
-          # commentaires inline ; repli sur un commentaire global si une ligne est hors diff
-          gh api -X POST "repos/$REPO/pulls/$PR/reviews" --input payload.json \
-            || gh pr comment "$PR" --body "$(jq -r 'map("- **\(.severity)** [\(.category)] `\(.file):\(.line)` — \(.message)") | join("\n")' findings.json)"
+          }' > out/payload.json
+          gh api -X POST "repos/$REPO/pulls/$PR/reviews" --input out/payload.json \
+            || gh pr comment "$PR" --body "$(jq -r 'map("- **\(.severity)** [\(.category)] `\(.file):\(.line)` — \(.message)") | join("\n")' out/findings.json)"
+
+      - name: monitoring — collecte du log + 3 métriques
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s out/runs.jsonl ] || { echo "Pas de run log."; exit 0; }
+          metrics="$(python3 agent/metrics.py out/runs.jsonl)"
+          {
+            echo "### Métriques de pilotage (run courant)"
+            echo '```json'
+            echo "$metrics"
+            echo '```'
+            echo "- **block_rate_pct** : % de runs bloqués (pression sécurité)"
+            echo "- **avg_findings** : findings moyens / run (charge de revue)"
+            echo "- **avg_duration_s** : latence moyenne du run agent"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload run log (collecte hors-CI)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-runs-${{ github.event.pull_request.head.sha }}
+          path: |
+            out/runs.jsonl
+            out/findings.json
 
       - name: gate — bloque sur critical
         run: |
           set -euo pipefail
-          [ -s findings.json ] || echo "[]" > findings.json
-          CRIT=$(jq '[.[] | select(.severity == "critical")] | length' findings.json)
+          [ -s out/findings.json ] || echo "[]" > out/findings.json
+          CRIT=$(jq '[.[] | select(.severity == "critical")] | length' out/findings.json)
           echo "findings critical : $CRIT"
           if [ "$CRIT" -gt 0 ]; then
             echo "::error::$CRIT finding(s) critical — PR bloquée"
